@@ -164,14 +164,14 @@ st.caption(
 if len(meta["gpl_ids"]) > 1:
     selected_gpl = st.selectbox(
         "Multiple platforms detected. Which platform would you like to use?",
-        tuple(f"{meta["gpl_ids"][i]}:  {meta["gpl_titles"][i]}" for i in range(len(meta["gpl_ids"]))),
+        tuple(f"{meta['gpl_ids'][i]}:  {meta['gpl_titles'][i]}" for i in range(len(meta['gpl_ids']))),
         index=None,
         placeholder="Select GPL"
     )
     if selected_gpl:
         selected_gpl = selected_gpl.split(":  ")[0]
-        meta["gsm_ids"] = meta["gsm_gpl_dict"][selected_gpl]
-        meta["gpl_ids"] = [selected_gpl]
+        meta['gsm_ids'] = meta["gsm_gpl_dict"][selected_gpl]
+        meta['gpl_ids'] = [selected_gpl]
 else:
     selected_gpl = meta["gpl_ids"][0]
 
@@ -1244,7 +1244,8 @@ if st.session_state.result_lists is not None:
             #print(st.session_state[f"pill_selector_{i}"])
             current_selection = st.session_state.get(f"pill_selector_{i}") or []
             if current_selection:
-                st.write(f"Example sample name: {"_".join([str(char_df[x].iloc[0]) for x in st.session_state[f"pill_selector_{i}"]])}_{char_df.index[0]}")
+                example_name = "_".join([str(char_df[x].iloc[0]) for x in st.session_state[f"pill_selector_{i}"]])
+                st.write(f"Example sample name: {example_name}_{char_df.index[0]}")
             else:
                 st.write(char_df.index[0])
             if st.button("Annotate Columns", key = f"annotate_columns_{i}"):
@@ -1310,10 +1311,11 @@ if st.session_state.result_lists is not None:
         )
 
         tsv = df.to_csv(sep="\t", index=False)
+        norm_suffix = "_" + st.session_state[f"norm_type_{i}"] if st.session_state[f"norm_type_{i}"] != "none" else ""
         st.download_button(
             label="⬇ Download as .txt (tab-separated)",
             key = f"download_{i}",
             data=tsv,
-            file_name=f"{gse_id}_{original_normalization}{"_"+st.session_state[f"norm_type_{i}"] if st.session_state[f"norm_type_{i}"] != "none" else ""}.txt",
+            file_name=f"{gse_id}_{original_normalization}{norm_suffix}.txt",
             mime="text/plain",
         )
