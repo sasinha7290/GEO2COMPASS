@@ -17,13 +17,4 @@ tarfile
 dataclasses
 typing
 numpy
-pathlib
-tempfile
-urllib.parse
-io
-json
-gzip
-tarfile
-dataclasses
-typing
-concurrent.futures
+gprofiler
