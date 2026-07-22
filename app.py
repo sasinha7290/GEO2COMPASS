@@ -18,8 +18,8 @@ from dataclasses import dataclass, field
 from typing import Optional
 import numpy as np
 
-st.set_page_config(page_title="GEO2COMPASS")
-st.title("GEO2COMPASS")
+st.set_page_config(page_title="GEO-2-COMPASS")
+st.title("GEO-2-COMPASS")
 
 gse_id = st.text_input("Enter GEO accession:", placeholder="e.g. GSE183620")
 
