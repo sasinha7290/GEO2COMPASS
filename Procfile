@@ -1,1 +1,1 @@
-web: streamlit run app.py --server.port $PORT --server.address 0.0.0.0 --server.headless true
+web: ARROW_DEFAULT_MEMORY_POOL=system streamlit run app.py --server.port $PORT --server.address 0.0.0.0 --server.headless true --server.fileWatcherType none

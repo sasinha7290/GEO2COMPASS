@@ -1,32 +1,60 @@
-from pathlib import Path
+import concurrent.futures
+import gc
+import gzip
+import io
+import json
+import os
+import re
+import tarfile
 import tempfile
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
+from urllib.parse import urljoin
+
+# PyArrow 25.0.0 can segfault when Streamlit initializes Arrow from a
+# ScriptRunner thread. Use the system allocator even if the deployment
+# environment does not define this variable.
+os.environ.setdefault("ARROW_DEFAULT_MEMORY_POOL", "system")
+
 import GEOparse
 import numpy as np
 import pandas as pd
-import streamlit as st
-from urllib.parse import urljoin
 import requests
+import streamlit as st
 from bs4 import BeautifulSoup
-import concurrent.futures
-import gzip
-from gprofiler import GProfiler 
-import io
-import json
-import re
-import tarfile
-from dataclasses import dataclass, field
-from typing import Optional
-import numpy as np
+from gprofiler import GProfiler
 
-st.set_page_config(page_title="GEO-2-COMPASS")
-st.title("GEO-2-COMPASS")
+st.set_page_config(page_title="GEO2COMPASS")
+st.title("GEO2COMPASS")
 
-gse_id = st.text_input("Enter GEO accession:", placeholder="e.g. GSE183620")
+MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024
+MAX_MATRIX_CELLS = 20_000_000
+PREVIEW_ROWS = 1_000
+PREVIEW_COLUMNS = 50
 
+with st.form("geo_accession_form"):
+    requested_gse_id = st.text_input(
+        "Enter GEO accession:",
+        value=st.session_state.get("active_gse_id", ""),
+        placeholder="e.g. GSE183620",
+    )
+    load_accession = st.form_submit_button("Load GEO metadata", type="primary")
+
+if load_accession:
+    requested_gse_id = requested_gse_id.strip().upper()
+    if not re.fullmatch(r"GSE\d+", requested_gse_id):
+        st.error("Enter a valid GEO Series accession, such as GSE183620.")
+        st.stop()
+    if requested_gse_id != st.session_state.get("active_gse_id"):
+        st.session_state.clear()
+        st.session_state["active_gse_id"] = requested_gse_id
+        st.rerun()
+
+gse_id = st.session_state.get("active_gse_id", "")
 if not gse_id:
+    st.info("Enter a GEO Series accession and select **Load GEO metadata**.")
     st.stop()
-
-gse_id = gse_id.strip().upper()
 
 if "run_pipeline" not in st.session_state:
     st.session_state.run_pipeline = False
@@ -37,25 +65,22 @@ if "dp_text" not in st.session_state:
 if "char_df" not in st.session_state:
     st.session_state.char_df = pd.DataFrame()
 
-@st.cache_data(show_spinner="Fetching GEO metadata…")
-def fetch_metadata(gse_id: str) -> dict:
+def fetch_metadata(gse_id: str, gse) -> dict:
     try:
-        #"https://ftp.ncbi.nlm.nih.gov/geo/series/GSE50nnn/GSE50081/soft/GSE50081_family.soft.gz"
-        
-        gpl_ids = list(GLOBAL_GSE.gpls.keys())
+        gpl_ids = list(gse.gpls.keys())
         gpl_titles = [
-            GLOBAL_GSE.gpls[gpl_id].metadata.get('title', [''])[0] 
+            gse.gpls[gpl_id].metadata.get('title', [''])[0]
             for gpl_id in gpl_ids
         ]
-        
-        gsm_list = list(GLOBAL_GSE.gsms.keys())
+
+        gsm_list = list(gse.gsms.keys())
 
         gsm_to_gpl = {}
         gsm_gpl_dict = {gpl_id: [] for gpl_id in gpl_ids}
 
         gsm_gpl_dict["Unknown"] = [] 
         
-        for gsm_id, gsm_obj in GLOBAL_GSE.gsms.items():
+        for gsm_id, gsm_obj in gse.gsms.items():
             platform_list = gsm_obj.metadata.get('platform_id', [])
             associated_gpl = platform_list[0] if platform_list else ""
             gsm_to_gpl[gsm_id] = associated_gpl
@@ -67,21 +92,21 @@ def fetch_metadata(gse_id: str) -> dict:
             else:
                 gsm_gpl_dict["Unknown"].append(gsm_id)
             
-        gse_types = GLOBAL_GSE.metadata.get('type', [])
+        gse_types = gse.metadata.get('type', [])
         gse_types_str = " ".join(gse_types).lower()
         study_type = "Microarray" if "array" in gse_types_str else "RNA-seq"
         
         taxon = ""
-        if 'organism' in GLOBAL_GSE.metadata and GLOBAL_GSE.metadata['organism']:
-            taxon = GLOBAL_GSE.metadata['organism'][0]
-        elif GLOBAL_GSE.gsms:
-            first_gsm = next(iter(GLOBAL_GSE.gsms.values()))
+        if 'organism' in gse.metadata and gse.metadata['organism']:
+            taxon = gse.metadata['organism'][0]
+        elif gse.gsms:
+            first_gsm = next(iter(gse.gsms.values()))
             organism_list = first_gsm.metadata.get('organism_ch1', [])
             if organism_list:
                 taxon = organism_list[0]
 
         return {
-            "title":      GLOBAL_GSE.metadata.get('title', [gse_id])[0],
+            "title":      gse.metadata.get('title', [gse_id])[0],
             "type":       study_type,
             "gsm_ids":    gsm_list,
             "gpl_ids":    gpl_ids,
@@ -94,65 +119,85 @@ def fetch_metadata(gse_id: str) -> dict:
     except Exception as e:
         return {"error": str(e)}
 
+@st.cache_resource(
+    show_spinner="Downloading and parsing GEO metadata…",
+    ttl=3600,
+    max_entries=1,
+)
 def get_gse(gse_id):
     url = f"https://ftp.ncbi.nlm.nih.gov/geo/series/{gse_id[:-3]}nnn/{gse_id}/soft/{gse_id}_family.soft.gz"
-    
-    print(f" [Downloading] Fetching data directly from: {url}")
-    
-    try:
-        # Stream the download
-        response = requests.get(url, stream=True)
-        response.raise_for_status()
-        
-        # Use a NamedTemporaryFile so it has a valid string path for GEOparse
-        with tempfile.NamedTemporaryFile(suffix=".soft.gz", delete=True) as temp_file:
-            # Write the downloaded chunks to the temporary file
-            for chunk in response.iter_content(chunk_size=8192):
-                if chunk:
-                    temp_file.write(chunk)
-            
-            # Flush the buffer to ensure all data is written to disk
-            temp_file.flush()
-            
-            print(f"Parsing data with GEOparse from temporary file...")
-            # Pass the string path of the temporary file
-            return GEOparse.get_GEO(filepath=temp_file.name, geotype = "GSE")
-            
-    except requests.exceptions.RequestException as e:
-        st.error(f"Download failed: {e}")
-        st.stop()
-    except Exception as e:
-        st.error(f"Failed to parse GEO data: {e}")
-        st.stop()
 
-def get_dp_and_char():
-    first_gsm = GLOBAL_GSE.gsms[meta["gsm_ids"][0]]
-    dp_text = first_gsm.metadata['data_processing'][0]
+    print(f" [Downloading] Fetching data directly from: {url}")
+
+    try:
+        with requests.get(
+            url,
+            stream=True,
+            timeout=(30, 300),
+        ) as response:
+            response.raise_for_status()
+
+            with tempfile.NamedTemporaryFile(
+                suffix=".soft.gz",
+                delete=True,
+            ) as temp_file:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        temp_file.write(chunk)
+
+                temp_file.flush()
+                print("Parsing data with GEOparse from temporary file...")
+                return GEOparse.get_GEO(
+                    filepath=temp_file.name,
+                    geotype="GSE",
+                )
+    except requests.exceptions.RequestException as e:
+        raise RuntimeError(f"Download failed: {e}") from e
+    except Exception as e:
+        raise RuntimeError(f"Failed to parse GEO data: {e}") from e
+
+def get_dp_and_char(gse, meta):
+    first_gsm = gse.gsms[meta["gsm_ids"][0]]
+    dp_text = first_gsm.metadata.get("data_processing", [""])[0]
     st.session_state["dp_text"] = dp_text
-    char_list = [x.split(": ")[0] for x in first_gsm.metadata["characteristics_ch1"]]
-    char_df = pd.DataFrame(columns = char_list)
+    char_list = list(dict.fromkeys(
+        x.split(": ", 1)[0]
+        for x in first_gsm.metadata.get("characteristics_ch1", [])
+    ))
+    char_df = pd.DataFrame(columns=char_list)
     for gsm in meta["gsm_ids"]:
-        gsm_data = GLOBAL_GSE.gsms[gsm]
+        gsm_data = gse.gsms[gsm]
         new_row = {}
-        for x in gsm_data.metadata["characteristics_ch1"]:
+        for x in gsm_data.metadata.get("characteristics_ch1", []):
             if ": " in x:
-                new_row[x.split(": ")[0]] = x.split(": ")[1]
+                key, value = x.split(": ", 1)
+                new_row[key] = value
             else:
-                new_row[x.split(": ")[0]] = x.split(": ")[0]
+                new_row[x] = x
         char_df.loc[gsm_data.metadata["geo_accession"][0]] = new_row
         if "treatment_protocol_ch1" in gsm_data.metadata.keys():
             char_df.loc[gsm_data.metadata["geo_accession"][0], "treatment_protocol"] = gsm_data.metadata["treatment_protocol_ch1"][0]
         if "growth_protocol_ch1" in gsm_data.metadata.keys():
             char_df.loc[gsm_data.metadata["geo_accession"][0], "growth_protocol"] = gsm_data.metadata["growth_protocol_ch1"][0]
-    st.session_state["char_df"] = char_df
+    st.session_state["char_df"] = char_df.astype("string")
 
-GLOBAL_GSE = get_gse(gse_id)
-meta = fetch_metadata(gse_id)
-get_dp_and_char()
+try:
+    GLOBAL_GSE = get_gse(gse_id)
+except RuntimeError as exc:
+    st.error(str(exc))
+    st.stop()
+
+meta = fetch_metadata(gse_id, GLOBAL_GSE)
 
 if meta.get("error"):
     st.error(f"Failed to load metadata: {meta['error']}")
     st.stop()
+
+if not meta.get("gsm_ids") or not meta.get("gpl_ids"):
+    st.error("The GEO record does not contain usable sample or platform metadata.")
+    st.stop()
+
+get_dp_and_char(GLOBAL_GSE, meta)
 
 st.subheader(meta["title"])
 st.caption(
@@ -172,6 +217,9 @@ if len(meta["gpl_ids"]) > 1:
         selected_gpl = selected_gpl.split(":  ")[0]
         meta['gsm_ids'] = meta["gsm_gpl_dict"][selected_gpl]
         meta['gpl_ids'] = [selected_gpl]
+    else:
+        st.info("Select one platform before building the matrix.")
+        st.stop()
 else:
     selected_gpl = meta["gpl_ids"][0]
 
@@ -185,7 +233,7 @@ def needs_log(dp_text: str):
         if y in dp_text.lower(): 
             return True, y
     
-    if "raw" in dp_text:
+    if "raw" in dp_text.lower():
         return False, "raw"
     
     return False, dp_text
@@ -194,6 +242,15 @@ def to_cpm(df):
     numeric_df = df.apply(pd.to_numeric, errors="coerce")
     col_sums = numeric_df.sum(axis=0).replace(0, np.nan)
     return numeric_df.divide(col_sums, axis=1) * 1e6
+
+def reduce_matrix_memory(df: pd.DataFrame) -> pd.DataFrame:
+    """Downcast numeric columns so one large matrix fits a small web worker."""
+    for column in df.select_dtypes(include=[np.number]).columns:
+        if pd.api.types.is_integer_dtype(df[column]):
+            df[column] = pd.to_numeric(df[column], downcast="integer")
+        else:
+            df[column] = pd.to_numeric(df[column], downcast="float")
+    return df
 
 # # # # # # # # # # # # # # # #
 # GENE SYMBOL ANNOTATION  # # # 
@@ -279,7 +336,7 @@ def gene_convert(gpl_df, gse, best_col, symbol_col):
 
     target_namespace = "HGNC" if species == "hsapiens" else "MGI"
 
-    id = gpl_df[best_col].iloc[0]
+    id = str(gpl_df[best_col].iloc[0])
     print(id.strip()[:3].lower() == "eg:")
     numeric_namespace = None
     if (bool(re.match(r"^\d+(_at)?$", id))):
@@ -325,7 +382,7 @@ def get_gene_symbol_column(gse_id, counts_df, selected_gpl, probe_ids=None):
     else:
         index_set = {_normalize_id(v) for v in counts_df.index}
 
-    if gpl_df.empty:
+    if gpl_df is None or gpl_df.empty:
         gpl_df = pd.DataFrame({"id": list(index_set)})
         gpl_df["gene_symbol"] = gpl_df["id"]
         gpl_df, symbol_col = gene_convert(gpl_df, gse, "id", "gene_symbol")
@@ -448,7 +505,7 @@ class GseResult:
         return written
 
     def __repr__(self) -> str:
-        df    = self.norm_df or self.counts_df
+        df = self.norm_df if self.norm_df is not None else self.counts_df
         shape = f"{df.shape[0]}g x {df.shape[1]}s" if df is not None else "no matrix"
         return (f"GseResult(acc={self.accession!r}, "
                 f"orig_norm={self.normalization_type!r}, "
@@ -478,25 +535,37 @@ def classify_normalization(dp_text: str) -> str:
 
 #bytes download
 
-def _download_bytes(url: str) -> bytes:
+def _download_bytes(url: str) -> Optional[bytes]:
     url = url.replace("ftp://", "https://", 1)
-    head_resp = requests.head(url, timeout=30)
-    head_resp.raise_for_status()
-    
-    file_size = int(head_resp.headers.get('Content-Length', 0))
-    max_size = 100 * 1024 * 1024 
-    
-    if file_size > max_size:
-        return None
-    resp = requests.get(url, timeout=300)
-    
-    resp.raise_for_status()
-    return resp.content
+    with requests.get(
+        url,
+        stream=True,
+        timeout=(30, 300),
+    ) as resp:
+        resp.raise_for_status()
 
-def _download_all(urls: list[str]) -> dict[str, bytes]:
-    results: dict[str, bytes] = {}
+        file_size = int(resp.headers.get("Content-Length", 0))
+        if file_size > MAX_DOWNLOAD_BYTES:
+            return None
+
+        payload = bytearray()
+        for chunk in resp.iter_content(chunk_size=1024 * 1024):
+            if not chunk:
+                continue
+            payload.extend(chunk)
+            if len(payload) > MAX_DOWNLOAD_BYTES:
+                return None
+
+        return bytes(payload)
+
+def _download_all(urls: list[str]) -> dict[str, Optional[bytes]]:
+    results: dict[str, Optional[bytes]] = {}
+    if not urls:
+        return results
     print(f"  Downloading {len(urls)} file(s) in parallel…")
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(64, len(urls))) as ex:
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=min(4, len(urls)),
+    ) as ex:
         fut_to_url = {ex.submit(_download_bytes, u): u for u in urls}
         for fut in concurrent.futures.as_completed(fut_to_url):
             url = fut_to_url[fut]
@@ -528,20 +597,6 @@ def _decompress(raw: bytes, name: str) -> tuple[bytes, str]:
 def _detect_sep(name: str) -> str:
     return "," if name.lower().endswith(".csv") else "\t"
 
-
-def _unpack_tar(raw: bytes) -> dict[str, bytes]:
-    buf = io.BytesIO(raw)
-    members: dict[str, bytes] = {}
-    with tarfile.open(fileobj=buf, mode="r:*") as tf:
-        for member in tf.getmembers():
-            if not member.isfile():
-                continue
-            name = Path(member.name).name
-            if _is_tabular(name):
-                f = tf.extractfile(member)
-                if f:
-                    members[name] = f.read()
-    return members
 
 #tested
 def _scrape_geo_download_page(accession):
@@ -605,11 +660,15 @@ def _scrape_geo_download_page(accession):
 def select_download_urls(candidates, accession, norm_type):
     submitter_candidates = []
     for c in candidates:
-        if c.ncbi_data and "raw" in c.filename:
+        if c.ncbi_data and "raw" in c.filename.lower():
             return [c], "raw_counts"
-        elif not c.ncbi_data:
+        if not c.ncbi_data:
             submitter_candidates.append(c)
-    return [submitter_candidates[0]], norm_type
+    if submitter_candidates:
+        return [submitter_candidates[0]], norm_type
+    if candidates:
+        return [candidates[0]], candidates[0].normalization
+    return [], norm_type
 
 #constructing the dataframe
 
@@ -634,7 +693,11 @@ def _parse_tabular_series(raw: bytes, filename: str) -> tuple[pd.Series, str]:
     else:
         count_col = num_cols[0]
 
-    s = pd.to_numeric(df[count_col], errors="coerce")
+    s = pd.to_numeric(
+        df[count_col],
+        errors="coerce",
+        downcast="integer",
+    )
     s.index = gene_index
 
     stem = re.sub(r"\.gz$", "", filename, flags=re.IGNORECASE)
@@ -648,17 +711,25 @@ def _build_matrix_from_tar(url_bytes, file_meta):
         raw = url_bytes.get(meta.url)
         if raw is None:
             continue
-        members = _unpack_tar(raw)
-        for mname, mbytes in members.items():
-            
-            mbytes, bare = _decompress(mbytes, mname)
-            try:
-                s, sname = _parse_tabular_series(mbytes, bare)
-                s.name   = sname
-                series_list.append(s)
-            except Exception as e:
-                print(f"    [warn] {mname}: {e}")
-                return pd.DataFrame()
+        with tarfile.open(fileobj=io.BytesIO(raw), mode="r:*") as tf:
+            for member in tf:
+                if not member.isfile():
+                    continue
+                mname = Path(member.name).name
+                if not _is_tabular(mname):
+                    continue
+                extracted = tf.extractfile(member)
+                if extracted is None:
+                    continue
+                try:
+                    mbytes, bare = _decompress(extracted.read(), mname)
+                    s, sname = _parse_tabular_series(mbytes, bare)
+                    s.name = sname
+                    series_list.append(s)
+                    del mbytes
+                except Exception as e:
+                    print(f"    [warn] {mname}: {e}")
+                    return pd.DataFrame()
  
     if not series_list:
         return pd.DataFrame()
@@ -667,7 +738,6 @@ def _build_matrix_from_tar(url_bytes, file_meta):
     df = pd.concat(series_list, axis=1, join="outer")
     df = df.apply(pd.to_numeric, errors="coerce")
     df.index.name = "gene_id"
-    print(df)
     print(f"  ✓ Matrix: {df.shape[0]} genes × {df.shape[1]} samples")
     return df
 
@@ -803,21 +873,22 @@ def fetch_and_normalize(
  
     candidates = _scrape_geo_download_page(accession)
     if not candidates:
-        return [GseResult(
-            accession=accession, normalization_type="unknown",
-            effective_norm="unknown"
-        )]
-    
-    num_supplementary = 0
+        return []
 
-    for c in candidates:
-        if not c.ncbi_data:
-            num_supplementary += 1
+    selected_candidates, inferred_norm = select_download_urls(
+        candidates,
+        accession,
+        classify_normalization(dp_text),
+    )
 
     results = []
-    
-    for c in candidates:
+
+    # Process one matrix per run. The previous implementation retained every
+    # raw/FPKM/TPM candidate simultaneously and could exceed Railway memory.
+    for c in selected_candidates:
         selected = [c]
+        if c.normalization == "unknown":
+            c.normalization = inferred_norm
         print(f"\n  Selected {len(selected)} file(s) to download:")
         for m in selected:
             print(f"    {'[TAR]' if m.is_tar else '     '} {m.filename}")
@@ -828,16 +899,23 @@ def fetch_and_normalize(
             print(f"Exceeded file size, skipping this file {c.url}")
             continue
 
-        if num_supplementary == 1 and not c.ncbi_data:
-            c.normalization = classify_normalization(dp_text)
-
         print("\n  Building count matrix…")
         counts_df = _fetch_counts_df(accession, selected, url_bytes)
+        del url_bytes
+        gc.collect()
         
         if counts_df.empty:
             continue
+
+        if counts_df.size > MAX_MATRIX_CELLS:
+            raise MemoryError(
+                "The selected matrix contains "
+                f"{counts_df.size:,} cells, above this deployment's "
+                f"{MAX_MATRIX_CELLS:,}-cell safety limit."
+            )
         
         counts_df = _annotate_counts(accession, selected, counts_df, selected_gpl)
+        counts_df = reduce_matrix_memory(counts_df)
         
         result = GseResult(
             accession=accession,
@@ -850,7 +928,8 @@ def fetch_and_normalize(
         results.append(result)
 
     if save_output:
-        results.save(output_dir)
+        for result in results:
+            result.save(output_dir)
 
     return results
 
@@ -869,16 +948,24 @@ def fetch_rnaseq_matrix(gse_id: str, meta):
     result_lists = []
 
     for result in results:
-        filtered_cols = [col for col in list(result.counts_df.columns) if any(gsm in col for gsm in meta["gsm_ids"]) and "gsm" in col.lower() or "gsm" not in col.lower()]
-        result.counts_df = result.counts_df[filtered_cols]
-        result.norm_df = result.counts_df
-
-        result.effective_norm = "none"
-
-        df = result.norm_df.copy()
+        if result.counts_df is None or result.counts_df.empty:
+            continue
+        retained_cols = [
+            col
+            for col in result.counts_df.columns
+            if "gsm" not in col.lower()
+            or any(gsm in col for gsm in meta["gsm_ids"])
+        ]
+        dropped_cols = [
+            col for col in result.counts_df.columns
+            if col not in retained_cols
+        ]
+        df = result.counts_df
+        if dropped_cols:
+            df.drop(columns=dropped_cols, inplace=True)
         df.index.name = None
         df.insert(0, "Name", df.index)
-        df = df.reset_index(drop=True)
+        df.reset_index(drop=True, inplace=True)
 
         st.info(
             f"Original normalization: **{result.normalization_type}** "
@@ -886,8 +973,12 @@ def fetch_rnaseq_matrix(gse_id: str, meta):
 
         #print(df)
 
-        result_list = [df, result.normalization_type, result.effective_norm]
+        result_list = [df, result.normalization_type, "none"]
         result_lists.append(result_list)
+        result.counts_df = None
+        result.norm_df = None
+
+    gc.collect()
 
     return result_lists
 
@@ -939,20 +1030,32 @@ def _annotate_matrix(df: pd.DataFrame) -> pd.DataFrame:
 
 def fetch_microarray_matrix(meta: dict):
     dp_text = st.session_state["dp_text"]
+    summ_norm = "unknown"
     if dp_text.strip():
         print("Classifying normalization type…")
         is_log, summ_norm = needs_log(dp_text)
 
     final_df = GLOBAL_GSE.pivot_samples(values="VALUE")[meta["gsm_ids"]]
-    print("\t \t COLUMNS \t \t")
-    print(final_df.columns)
-    print(final_df)
-    print(f"\n Number of Columns: \t \t {len(final_df.columns)}")
+    print(f"Microarray matrix contains {len(final_df.columns)} samples.")
     final_df = _annotate_matrix(final_df)
+    final_df = reduce_matrix_memory(final_df)
 
     norm_type = "none"
 
     return [[final_df, summ_norm, norm_type]]
+
+@st.cache_data(show_spinner=False, max_entries=2)
+def dataframe_to_gzip_tsv(df: pd.DataFrame) -> bytes:
+    """Serialize a dataframe without materializing a second plain-text copy."""
+    output = io.BytesIO()
+    with gzip.GzipFile(fileobj=output, mode="wb") as gzip_file:
+        with io.TextIOWrapper(
+            gzip_file,
+            encoding="utf-8",
+            newline="",
+        ) as text_file:
+            df.to_csv(text_file, sep="\t", index=False)
+    return output.getvalue()
 
 # # # # # # # # # # # # # # # #
 # USER INTERFACE  # # # # # # # 
@@ -960,6 +1063,10 @@ def fetch_microarray_matrix(meta: dict):
 
 @st.fragment
 def survival_metadata_ui(char_df):
+    if char_df.empty or not len(char_df.columns):
+        st.info("No sample characteristics are available for survival metadata.")
+        return
+
     if "survival_df" not in st.session_state:
         st.session_state.survival_df = pd.DataFrame(index=char_df.index)
         st.session_state.survival_df["GSM"] = char_df.index
@@ -1163,8 +1270,9 @@ if st.session_state.run_pipeline and st.session_state.result_lists is None:
             )
             result_lists = fetch_rnaseq_matrix(gse_id, meta)
 
-        if result_lists is None:
+        if not result_lists:
             status.update(label="Pipeline failed.", state="error")
+            st.error("No usable expression matrix was found for this accession.")
             st.stop()
         st.session_state.result_lists = result_lists
         status.update(label="Done!", state="complete")
@@ -1301,8 +1409,18 @@ if st.session_state.result_lists is not None:
                 )
                 df = st.session_state[df_key]
         
+        preview_columns = list(df.columns[:PREVIEW_COLUMNS])
+        preview_df = df.loc[:, preview_columns].head(PREVIEW_ROWS)
+        if len(df) > PREVIEW_ROWS or len(df.columns) > PREVIEW_COLUMNS:
+            st.caption(
+                "Showing a memory-safe preview of "
+                f"{len(preview_df):,}/{len(df):,} rows and "
+                f"{len(preview_columns):,}/{len(df.columns):,} columns. "
+                "The download contains the complete matrix."
+            )
+
         st.dataframe(
-            df,
+            preview_df,
             width='stretch',
             hide_index=True,
             column_config={
@@ -1310,12 +1428,12 @@ if st.session_state.result_lists is not None:
             },
         )
 
-        tsv = df.to_csv(sep="\t", index=False)
+        tsv_gz = dataframe_to_gzip_tsv(df)
         norm_suffix = "_" + st.session_state[f"norm_type_{i}"] if st.session_state[f"norm_type_{i}"] != "none" else ""
         st.download_button(
-            label="⬇ Download as .txt (tab-separated)",
+            label="⬇ Download complete matrix (.txt.gz)",
             key = f"download_{i}",
-            data=tsv,
-            file_name=f"{gse_id}_{original_normalization}{norm_suffix}.txt",
-            mime="text/plain",
+            data=tsv_gz,
+            file_name=f"{gse_id}_{original_normalization}{norm_suffix}.txt.gz",
+            mime="application/gzip",
         )

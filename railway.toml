@@ -2,6 +2,8 @@
 builder = "nixpacks"
 
 [deploy]
-startCommand = "streamlit run app.py --server.port $PORT --server.address 0.0.0.0 --server.headless true"
+startCommand = "ARROW_DEFAULT_MEMORY_POOL=system streamlit run app.py --server.port $PORT --server.address 0.0.0.0 --server.headless true --server.fileWatcherType none"
+healthcheckPath = "/_stcore/health"
+healthcheckTimeout = 300
 restartPolicyType = "on_failure"
-restartPolicyMaxRetries = 3
+restartPolicyMaxRetries = 10
