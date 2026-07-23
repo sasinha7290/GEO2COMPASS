@@ -25,8 +25,8 @@ import streamlit as st
 from bs4 import BeautifulSoup
 from gprofiler import GProfiler
 
-st.set_page_config(page_title="GEO2COMPASS")
-st.title("GEO2COMPASS")
+st.set_page_config(page_title="GEO-2-COMPASS")
+st.title("GEO-2-COMPASS")
 
 MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024
 MAX_MATRIX_CELLS = 20_000_000
