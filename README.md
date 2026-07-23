@@ -1,4 +1,4 @@
-# GEO2COMPASS
+# GEO-2-COMPASS
 
 GEO2COMPASS is a Streamlit application for retrieving gene-expression studies
 from the NCBI Gene Expression Omnibus (GEO) and converting them into
