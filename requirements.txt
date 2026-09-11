@@ -6,4 +6,3 @@ streamlit==1.50.0
 requests==2.32.4
 beautifulsoup4==4.12.3
 gprofiler-official==1.0.0
-aria2c
