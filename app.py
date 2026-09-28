@@ -357,6 +357,7 @@ def gene_convert(gpl_df, gse, best_col, symbol_col):
         return gpl_df, symbol_col
     else:
         gpl_df["new_id_col"] = gpl_df[best_col].astype(str).str.replace(r"_at$", "", regex=True)
+        gpl_df["new_id_col"] = gpl_df[best_col].astype(str).str.replace(r"\.\d+$", "", regex=True)
         if (str(gpl_df[best_col].iloc[0]).strip()[:3].lower() == "eg:"):
             gpl_df["new_id_col"] = gpl_df[best_col].astype(str).str.split(':').str[1]
 
@@ -373,7 +374,7 @@ def gene_convert(gpl_df, gse, best_col, symbol_col):
         
         results_deduped = results.drop_duplicates(subset="incoming", keep="first")
         mapping = results_deduped.set_index("incoming")["name"]
-        gpl_df["gene_symbol"] = gpl_df["new_id_col"].values 
+
         gpl_df["gene_symbol"] = [mapping.get(id_, float("nan")) for id_ in gpl_df["new_id_col"]]
 
         return gpl_df, "gene_symbol"
