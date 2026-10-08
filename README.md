@@ -19,22 +19,24 @@ generation, and compressed matrix downloads.
 - Apply log, CPM, and log-CPM transformations
 - Annotate sample columns using GEO characteristics
 - Create survival-analysis metadata
-- Download the complete matrix as a compressed, tab-separated file
+- Review quality-control plots and choose download columns
+- Download the complete matrix as a compressed, tab-separated file with a provenance record
+- Cache working matrices as Parquet files on the server
 
 ## Requirements
 
 - Python 3.11
 - Internet access to NCBI GEO and g:Profiler
-- At least 1 GB of memory is recommended for typical deployments
+- Sufficient memory and temporary disk space for the chosen GEO study
 
 The application includes safety limits for hosted environments:
 
-- Maximum individual download: 100 MB
-- Maximum expression matrix: 20,000,000 cells
-- Browser preview: 1,000 rows and 50 columns
+- Maximum individual download: 5 GB
+- Maximum expression matrix: 150,000,000 cells
+- Browser preview: 1,000 rows and 150 columns
 
-These limits can be changed near the beginning of `app.py`, but increasing them
-may require a larger Railway memory plan.
+These limits are defined in `app.py`. Large studies can require substantial
+Railway memory and ephemeral disk space even when they fall within the limits.
 
 ## Run locally
 
@@ -64,7 +66,8 @@ Streamlit will display the local address in the terminal, normally
 3. If prompted, choose the GEO platform to process.
 4. Select **Fetch & Build Matrix**.
 5. Optionally annotate sample names or apply another normalization.
-6. Download the complete matrix as a `.txt.gz` file.
+6. Review quality-control results, choose columns, and download the matrix as a
+   `.txt.gz` file. A JSON provenance record is also available.
 
 Very large or unusually formatted GEO supplementary files may not be suitable
 for automatic processing. The app reports a clear error when a file exceeds its
@@ -72,8 +75,7 @@ configured download or matrix limit.
 
 ## Deploy on Railway
 
-1. Push every project file to a GitHub repository. Make sure the hidden
-   `.streamlit` folder and the new `runtime.txt` file are included.
+1. Push `app.py`, `requirements.txt`, `runtime.txt`, and `railway.toml` to GitHub.
 2. In Railway, create a project and select **Deploy from GitHub repo**.
 3. Select this repository.
 4. Railway will use `railway.toml` as the deployment configuration.
@@ -102,8 +104,7 @@ The repository contains:
 
 - `railway.toml` — start command, health check, and restart policy
 - `Procfile` — compatible fallback start command
-- `runtime.txt` and `.python-version` — Python 3.11 selection
-- `.streamlit/config.toml` — headless server settings and disabled file watcher
+- `runtime.txt` — Python 3.11 selection
 - `requirements.txt` — pinned Python dependencies
 
 If the deployment builds successfully but Railway reports that the application
@@ -118,7 +119,7 @@ fatal Python segmentation fault in `pyarrow.pandas_compat`.
 
 This repository applies both available protections:
 
-- `pyarrow==24.0.0` is pinned in `requirements.txt`.
+- `pyarrow==18.1.0` is pinned in `requirements.txt`.
 - `ARROW_DEFAULT_MEMORY_POOL=system` is set by the application and Railway
   start command.
 
@@ -130,12 +131,12 @@ with this application.
 GEO studies can contain tens of millions of values. GEO2COMPASS reduces memory
 use by:
 
-- Processing one candidate matrix at a time
+- Processing candidate matrices with bounded concurrency
 - Limiting concurrent downloads
 - Streaming GEO metadata to a temporary file
 - Reading TAR members individually
 - Downcasting numeric columns when possible
-- Caching only one parsed GEO accession
+- Keeping working matrices as Parquet files instead of in Streamlit session memory
 - Displaying a bounded preview instead of the complete matrix
 - Producing gzip-compressed downloads
 
@@ -146,7 +147,7 @@ more memory or process the dataset locally.
 
 ### The app restarts with a segmentation fault
 
-Confirm that the deployment installed `pyarrow==24.0.0` and that the Railway
+Confirm that the deployment installed `pyarrow==18.1.0` and that the Railway
 start command still contains `ARROW_DEFAULT_MEMORY_POOL=system`. Redeploy
 without the previous build cache if Railway reused an older dependency layer.
 
@@ -177,4 +178,3 @@ be determined.
 
 No license file is currently included. Add a license before distributing or
 accepting external contributions.
-
