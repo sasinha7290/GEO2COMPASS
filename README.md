@@ -59,7 +59,7 @@ On Windows PowerShell, activate the environment with:
 Streamlit will display the local address in the terminal, normally
 `http://localhost:8501`.
 
-## Using GEO2COMPASS
+## Using GEO-2-COMPASS
 
 1. Enter a GEO Series accession such as `GSE183620`.
 2. Select **Load GEO metadata**.
@@ -128,7 +128,7 @@ with this application.
 
 ## Memory management
 
-GEO studies can contain tens of millions of values. GEO2COMPASS reduces memory
+GEO studies can contain tens of millions of values. GEO-2-COMPASS reduces memory
 use by:
 
 - Processing candidate matrices with bounded concurrency
@@ -165,7 +165,7 @@ raising `MAX_MATRIX_CELLS` or `MAX_DOWNLOAD_BYTES` in `app.py`.
 ### Gene symbols are unavailable
 
 Some GEO platforms do not provide a usable identifier-to-symbol mapping.
-GEO2COMPASS retains the original identifiers when a reliable annotation cannot
+GEO-2-COMPASS retains the original identifiers when a reliable annotation cannot
 be determined.
 
 ## Data sources
